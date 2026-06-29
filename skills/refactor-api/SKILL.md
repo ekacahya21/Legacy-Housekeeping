@@ -37,30 +37,66 @@ After an audit has confirmed which endpoints are dead, remove them in three laye
 
 ---
 
-### 2. Standardize Controller Error Handling
+### 2. Standardize Controller Error Handling & Request Lifecycle
 
-#### 2.1 Create a Controller Wrapper
+#### 2.1 Create a Controller Wrapper with Validation and Observability
 
 **Language-agnostic pattern:** Extract a reusable wrapper that:
-1. Catches all errors from handler functions
-2. Logs the error
-3. Returns a consistent error response
+1. Generates or forwards a request-level Correlation ID.
+2. Integrates input schema validation handlers.
+3. Catches and logs errors structurally with correlation context.
+4. Returns consistent response formats (ensuring existing contract shapes are preserved).
 
 ```pseudocode
-FUNCTION wrap(handler):
+FUNCTION wrap(handler, schema = NULL):
     RETURN FUNCTION(request, response, next):
+        // 1. Establish request-scoped Correlation ID
+        correlationId = request.headers["x-correlation-id"] OR generateUUID()
+        context.set("correlationId", correlationId)
+        
         TRY:
+            // 2. Perform Input validation (if schema provided)
+            IF schema IS NOT NULL THEN
+                validatedData = schema.validate(request.body, request.query, request.params)
+                request.validated = validatedData
+                
             AWAIT handler(request, response, next)
+            
         CATCH error:
-            logger.error("Controller error", error)
-            response.status(500).json({
-                status: 500,
-                message: error.message OR "Internal server error"
-            })
+            // 3. Handle schema/input validation errors (maps to 400 Bad Request)
+            IF error IS ValidationError THEN
+                logger.warn("Validation failed", {
+                    correlationId: correlationId,
+                    errors: error.details,
+                    path: request.path
+                })
+                
+                // Map validation error back to standard error shape of target codebase
+                response.status(400).json({
+                    status: 400,
+                    message: "Validation failed",
+                    errors: error.details 
+                })
+            ELSE
+                // 4. Handle internal errors securely (maps to 500)
+                logger.error("Controller execution failed", {
+                    correlationId: correlationId,
+                    message: error.message,
+                    stack: error.stack,
+                    method: request.method,
+                    path: request.path
+                })
+                
+                response.status(500).json({
+                    status: 500,
+                    message: "Internal server error",
+                    // Avoid leaking raw stacks to users, but keep shape consistent
+                    error: "An unexpected error occurred"
+                })
 
 FUNCTION sendSuccess(response, data):
     IF data has a "status" field THEN
-        // Legacy model response — pass through verbatim
+        // Legacy model response — pass through verbatim to keep shape
         response.status(data.status).json(data)
     ELSE
         response.status(200).json({
@@ -72,27 +108,38 @@ FUNCTION sendSuccess(response, data):
 
 #### 2.2 Apply to All Controllers
 
-**Before — every handler has its own try/catch:**
+**Before — every handler has custom validations, logging, and try/catch:**
 
 ```pseudocode
 // In every single handler, duplicated N times
 HANDLER getData(request, response):
     TRY:
+        IF NOT isUUID(request.params.id) THEN
+            RETURN response.status(400).json({ error: "Invalid ID" })
+            
         result = model.getData(request.params.id)
         response.status(result.status).json(result)
     CATCH error:
+        console.error(error)
         response.status(500).json({ status: 500, error: error.message })
 ```
 
-**After — one wrapper eliminates all duplication:**
+**After — validation schema + one wrapper handles error, correlation IDs, and validations:**
 
 ```pseudocode
+// 1. Declare validation schema
+USER_ID_SCHEMA = Schema({
+    params: { id: UUID() }
+})
+
+// 2. Focused handler logic
 HANDLER getData(request, response):
-    result = model.getData(request.params.id)
+    // Access validated parameters from context
+    result = model.getData(request.validated.params.id)
     sendSuccess(response, result)
 
-// Register with wrapper:
-router.get("/data/:id", wrap(getData))
+// 3. Register route with wrapper
+router.get("/data/:id", wrap(getData, USER_ID_SCHEMA))
 ```
 
 #### 2.3 Fix Models That Accept (request, response)
@@ -209,7 +256,59 @@ exporter.exportToExcel(response, "A", headers, data, "report.xlsx")
 
 ---
 
-### 5. Refactoring Checklist
+### 5. Address Performance & Security Issues
+
+#### 5.1 Parameterize Queries (SQL Injection Prevention)
+
+Never use string concatenation or interpolation when building database query strings with user input. Use parameter binding supported by your database client/ORM.
+
+**Before (Vulnerable SQL injection):**
+```pseudocode
+// JS/TS concatenation vulnerability
+query = "SELECT * FROM users WHERE email = '" + request.body.email + "' AND status = 'active'"
+results = await db.query(query)
+```
+
+**After (Secure Parameterized query):**
+```pseudocode
+// Use placeholder bindings (?, $1, :name, etc. depending on SQL engine)
+query = "SELECT * FROM users WHERE email = ? AND status = ?"
+results = await db.query(query, [request.body.email, "active"])
+```
+
+#### 5.2 Resolve N+1 Queries (Eager Loading & Batching)
+
+Avoid running database queries inside loops (such as `for` loops, `.map`, or `.forEach`). Instead, fetch relation records in a single batch query or use database joins.
+
+**Before (N+1 database queries):**
+```pseudocode
+// 1 query to fetch posts
+posts = await db.query("SELECT * FROM posts WHERE category = ?", [category])
+
+// N queries to fetch authors
+FOR post IN posts:
+    post.author = await db.query("SELECT * FROM users WHERE id = ?", [post.authorId])
+```
+
+**After (Batch fetch / Eager preloading - keeps exact same JSON output shape):**
+```pseudocode
+posts = await db.query("SELECT * FROM posts WHERE category = ?", [category])
+
+// Collect unique IDs and batch fetch relations in one query
+authorIds = posts.MAP(p => p.authorId).FILTER_UNIQUE()
+
+IF authorIds IS NOT EMPTY THEN
+    authors = await db.query("SELECT * FROM users WHERE id IN (?)", [authorIds])
+    authorMap = MAP_BY_KEY(authors, "id")
+    
+    // Map relations back synchronously in memory
+    FOR post IN posts:
+        post.author = authorMap.GET(post.authorId)
+```
+
+---
+
+### 6. Refactoring Checklist
 
 Use this checklist before, during, and after every refactoring session to ensure nothing breaks.
 
@@ -219,14 +318,14 @@ Use this checklist before, during, and after every refactoring session to ensure
 - [ ] No unrelated feature changes included
 
 #### Contract Safety
-- [ ] Request structure is unchanged
-- [ ] Response structure is unchanged
+- [ ] Request structure is unchanged (strict query/param/body compliance)
+- [ ] Response structure is unchanged (strict JSON body shape compliance)
 - [ ] Status codes are unchanged
-- [ ] Error format is unchanged
+- [ ] Error format is unchanged (validation errors mapped to the existing error shape)
 
 #### Business Logic Safety
 - [ ] Business logic is preserved
-- [ ] Validation rules are preserved
+- [ ] Validation rules are preserved (or strengthened securely)
 - [ ] Permission checks are preserved
 - [ ] Database behavior is preserved
 - [ ] External service behavior is preserved
@@ -255,8 +354,8 @@ Use this checklist before, during, and after every refactoring session to ensure
 
 Use this skill after an `audit-api` pass to clean up the code that remains. The typical flow is:
 
-1. **audit-api** → Inventory, cross-reference, flag dead endpoints
-2. **refactor-api** → Standardize error handling, de-dup, extract shared modules
+1. **audit-api** → Inventory, cross-reference, flag dead endpoints, check security/performance leaks.
+2. **refactor-api** → Standardize error handling/validation wrappers, de-dup, parameterize queries, batch N+1 loops.
 
 During a normal development cycle, this skill can be used as a PR review checkpoint to verify that new code follows best practices before merging.
 

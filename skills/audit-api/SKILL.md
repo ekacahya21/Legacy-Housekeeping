@@ -32,6 +32,13 @@ sudo apt-get install -y default-jdk
 ```bash
 # Run the audit driver to inventory all endpoints, controllers, and models:
 driver.sh inventory ./src
+
+# Scan the codebase for security compliance (SQL injection patterns, missing guards):
+driver.sh check-security ./src
+
+# Scan the codebase for performance patterns (N+1 queries, blocking event loop calls):
+driver.sh check-performance ./src
+
 # Replace ./src with the path to your source code
 ```
 
@@ -144,10 +151,28 @@ Before touching any endpoint, ask these questions **in order**:
 - [ ] README/docs are current
 - [ ] TODO/FIXME comments have been reviewed
 
+#### Security
+- [ ] No raw query concatenations / SQL injections detected (Verify using `driver.sh check-security <src>`)
+- [ ] Every active route is protected by a suitable authentication guard/middleware (unless explicitly designed to be public)
+- [ ] No secrets, credentials, or API keys are hardcoded in the codebase
+
+#### Performance
+- [ ] No async database/network calls executed inside loops (N+1 query check; Verify using `driver.sh check-performance <src>`)
+- [ ] Database query filters/sorts match indexed fields in the schema
+- [ ] Event loop is non-blocking (no synchronous file system or heavy cryptographic calls in async request paths)
+
+#### Request Validation
+- [ ] All request payloads (body, query parameters, path params) are validated via schema validation (Zod, Joi, Pydantic, etc.)
+
+#### Observability
+- [ ] Standard logging utilities are used instead of raw stdout (`console.log`, `print`)
+- [ ] All logs are structured (e.g. JSON log outputs) and contain contextual metadata (timestamps, log levels)
+- [ ] Correlation IDs (Request Tracing) are propagated in logs for all request lifecycles
+
 #### Safety
 - [ ] No business logic change introduced
-- [ ] No API contract change introduced
-- [ ] No database schema change introduced
+- [ ] No API contract change introduced (request/response shapes remain strictly unchanged for all successful payloads)
+- [ ] No database schema change introduced that breaks compatibility
 - [ ] No authentication/authorization behavior change introduced
 - [ ] Build and tests pass
 - [ ] Test coverage compliance is met (new/modified files meet target coverage, no coverage regressions)
